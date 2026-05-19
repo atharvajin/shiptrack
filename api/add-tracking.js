@@ -24,15 +24,11 @@ module.exports = async (req, res) => {
     const { order_id, tracking_link } = req.body || {};
 
     if (!order_id) {
-      return res.status(400).json({
-        error: "order_id is required",
-      });
+      return res.status(400).json({ error: "order_id is required" });
     }
 
     if (!tracking_link) {
-      return res.status(400).json({
-        error: "tracking_link is required",
-      });
+      return res.status(400).json({ error: "tracking_link is required" });
     }
 
     const cleanOrderId = String(order_id).trim();
@@ -62,26 +58,41 @@ module.exports = async (req, res) => {
     }
 
     const parsed = parseTrackingLink(cleanLink);
-    const trackingIdFromUrl = parsed.tracking_id || extractIdFromUrl(cleanLink);
-    const courierFromUrl = parsed.courier || detectCourierFromUrl(cleanLink);
+
+    const fallbackTrackingId =
+      parsed.tracking_id || extractTrackingIdFromUrl(cleanLink);
+
+    const fallbackCourier =
+      parsed.courier || detectCourierFromUrl(cleanLink);
 
     let scraped = {
       status: "Pending",
       location: null,
       estimated_delivery: null,
       history: [],
-      courier: courierFromUrl,
+      courier: fallbackCourier,
     };
+
+    let scrape_ok = false;
+    let scrape_error = null;
 
     try {
       scraped = await scrapeTrackingUrl(cleanLink);
-    } catch (scrapeError) {
-      console.warn("[add-tracking scrape failed]", scrapeError.message);
+      scrape_ok = scraped.status && scraped.status !== "Pending";
+    } catch (err) {
+      scrape_error = err.message;
+      console.warn("[add-tracking scrape failed]", err.message);
     }
 
     const finalStatus = normalizeAppStatus(scraped.status || "Pending");
-    const finalCourier = scraped.courier || courierFromUrl;
-    const finalTrackingId = trackingIdFromUrl;
+    const finalCourier = scraped.courier || fallbackCourier;
+    const finalTrackingId = fallbackTrackingId;
+
+    const finalHistory = Array.isArray(scraped.history)
+      ? scraped.history
+      : [];
+
+    const finalEstimatedDelivery = normalizeDate(scraped.estimated_delivery);
 
     const { error: upsertError } = await supabase.from("shipments").upsert(
       {
@@ -91,9 +102,9 @@ module.exports = async (req, res) => {
         tracking_link: cleanLink,
         last_status: finalStatus,
         current_location: scraped.location || null,
-        estimated_delivery: normalizeDate(scraped.estimated_delivery),
+        estimated_delivery: finalEstimatedDelivery,
         last_updated: new Date().toISOString(),
-        raw_history: Array.isArray(scraped.history) ? scraped.history : [],
+        raw_history: finalHistory,
       },
       {
         onConflict: "order_id",
@@ -108,15 +119,21 @@ module.exports = async (req, res) => {
     }
 
     return res.status(201).json({
-      message: "Tracking link saved successfully",
+      message: "Tracking saved successfully",
       order_id: cleanOrderId,
       tracking_id: finalTrackingId,
       courier: finalCourier,
       status: finalStatus,
       current_location: scraped.location || null,
-      estimated_delivery: normalizeDate(scraped.estimated_delivery),
-      history: Array.isArray(scraped.history) ? scraped.history : [],
+      estimated_delivery: finalEstimatedDelivery,
+      history: finalHistory,
       tracking_link: cleanLink,
+      scrape_ok,
+      scrape_error,
+      note:
+        finalStatus === "Pending"
+          ? "Tracking URL was saved, but live courier status could not be extracted automatically."
+          : "Live courier status was extracted and saved.",
     });
   } catch (err) {
     console.error("[add-tracking error]", err);
@@ -128,12 +145,12 @@ module.exports = async (req, res) => {
   }
 };
 
-function extractIdFromUrl(url) {
+function extractTrackingIdFromUrl(url) {
   try {
     const u = new URL(url);
 
     for (const [, value] of u.searchParams) {
-      if (/^[A-Z0-9]{8,30}$/i.test(value)) {
+      if (/^[A-Z0-9]{8,35}$/i.test(value)) {
         return value.toUpperCase();
       }
     }
@@ -141,7 +158,7 @@ function extractIdFromUrl(url) {
     const parts = u.pathname.split("/").filter(Boolean).reverse();
 
     for (const part of parts) {
-      if (/^[A-Z0-9]{8,30}$/i.test(part)) {
+      if (/^[A-Z0-9]{8,35}$/i.test(part)) {
         return part.toUpperCase();
       }
     }
@@ -167,25 +184,25 @@ function normalizeAppStatus(status) {
 
   const s = String(status).toLowerCase();
 
-  if (s.includes("delivered") && !s.includes("out")) {
+  if (s.includes("out for delivery") || s.includes("out-for-delivery")) {
+    return "Out for Delivery";
+  }
+
+  if (s === "ofd" || s.includes(" with delivery agent")) {
+    return "Out for Delivery";
+  }
+
+  if (s.includes("delivered") && !s.includes("out for delivery")) {
     return "Delivered";
   }
 
   if (
-    s.includes("out for delivery") ||
-    s.includes("out-for-delivery") ||
-    s.includes("ofd") ||
-    s.includes("with delivery agent")
-  ) {
-    return "Out for Delivery";
-  }
-
-  if (
-    s.includes("transit") ||
+    s.includes("in transit") ||
     s.includes("reached") ||
     s.includes("arrived") ||
     s.includes("departed") ||
-    s.includes("hub")
+    s.includes("hub") ||
+    s.includes("facility")
   ) {
     return "In Transit";
   }
@@ -194,7 +211,8 @@ function normalizeAppStatus(status) {
     s.includes("exception") ||
     s.includes("failed") ||
     s.includes("attempted") ||
-    s.includes("undelivered")
+    s.includes("undelivered") ||
+    s.includes("unable to deliver")
   ) {
     return "Exception";
   }
@@ -203,7 +221,8 @@ function normalizeAppStatus(status) {
     s.includes("pending") ||
     s.includes("created") ||
     s.includes("info received") ||
-    s.includes("booked")
+    s.includes("booked") ||
+    s.includes("manifest")
   ) {
     return "Pending";
   }
