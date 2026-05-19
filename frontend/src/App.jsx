@@ -3,30 +3,56 @@ import { useState, useEffect, useCallback } from "react";
 const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
 async function apiFetch(path, opts = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json", ...opts.headers },
-    ...opts,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
-  const text = await res.text();
-  let data = {};
+  try {
+    const separator = path.includes("?") ? "&" : "?";
+    const cacheBustPath = `${path}${separator}_t=${Date.now()}`;
 
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch (_) {
-      data = {
-        error: `Server returned non-JSON response. Status: ${res.status}`,
-        details: text.slice(0, 500),
+    const res = await fetch(`${API_BASE}${cacheBustPath}`, {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        ...opts.headers,
+      },
+      cache: "no-store",
+      signal: controller.signal,
+      ...opts,
+    });
+
+    const text = await res.text();
+    let data = {};
+
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        data = {
+          error: `Server returned non-JSON response. Status: ${res.status}`,
+          details: text.slice(0, 500),
+        };
+      }
+    }
+
+    if (!res.ok) {
+      throw data.error
+        ? data
+        : { error: `Request failed with status ${res.status}` };
+    }
+
+    return data;
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw {
+        error: "Request timed out. Backend did not respond within 15 seconds.",
       };
     }
-  }
 
-  if (!res.ok) {
-    throw data.error ? data : { error: `Request failed with status ${res.status}` };
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return data;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -252,7 +278,14 @@ function OrderCard({ order, onUpdate }) {
       ) : (
         <div style={{ borderTop: "0.5px solid var(--color-border-tertiary)", padding: "12px 16px" }}>
           {showForm ? (
-            <AddTrackingForm orderId={order.order_id} onSuccess={onUpdate} onCancel={() => setShowForm(false)} />
+            <AddTrackingForm
+              orderId={order.order_id}
+              onSuccess={async () => {
+                setShowForm(false);
+                await onUpdate?.();
+              }}
+              onCancel={() => setShowForm(false)}
+            />
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span style={{ fontSize: 12, color: "var(--color-text-tertiary)" }}>No tracking added</span>
@@ -316,16 +349,18 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+
     if (!url.trim()) return;
+
     setError(null);
 
-    try { new URL(url.trim()); }
-    catch (_) {
+    try {
+      new URL(url.trim());
+    } catch (_) {
       setError("Invalid URL — paste the full https:// link from the courier website");
       return;
     }
 
-    // Simulate scraping steps in UI while real scraping happens
     const simulateSteps = async () => {
       for (let i = 0; i < SCRAPE_STEPS.length - 1; i++) {
         setStep(i);
@@ -335,7 +370,8 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
 
     try {
       setStep(0);
-      const [data] = await Promise.all([
+
+      await Promise.all([
         apiFetch("/add-tracking", {
           method: "POST",
           body: JSON.stringify({
@@ -345,9 +381,14 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
         }),
         simulateSteps(),
       ]);
+
       setStep(SCRAPE_STEPS.length - 1);
       await sleep(400);
-      onSuccess?.();
+
+      setUrl("");
+      setStep(-1);
+
+      await onSuccess?.();
     } catch (err) {
       setStep(-1);
       setError(err.error || err.message || "Failed to add tracking — try again");
