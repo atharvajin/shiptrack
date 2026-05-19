@@ -5,7 +5,7 @@
  */
 
 const https = require('https');
-const http  = require('http');
+const http = require('http');
 const { detectCourierFromUrl } = require('./parser');
 
 // ─── All possible shipment states ─────────────────────────────────────────────
@@ -72,13 +72,13 @@ function fetchUrl(url, options = {}) {
     const urlObj = new URL(url);
     const reqOptions = {
       hostname: urlObj.hostname,
-      path:     urlObj.pathname + urlObj.search,
-      method:   options.method || 'GET',
+      path: urlObj.pathname + urlObj.search,
+      method: options.method || 'GET',
       headers: {
-        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept':          'application/json, text/html, */*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/html, */*;q=0.8',
         'Accept-Language': 'en-IN,en;q=0.9',
-        'Cache-Control':   'no-cache',
+        'Cache-Control': 'no-cache',
         ...options.headers,
       },
       timeout: 9000,
@@ -111,15 +111,15 @@ function scrapeHtml(html, courierName) {
   }
 
   const text = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-                   .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-                   .replace(/<[^>]+>/g, ' ')
-                   .replace(/\s+/g, ' ')
-                   .trim();
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
   const lower = text.toLowerCase();
 
   // Detect status from full page text
-  let status = 'In Transit';
+  let status = 'Pending';
   for (const { keywords, s } of STATUS_MAP.map(m => ({ keywords: m.keywords, s: m.status }))) {
     if (keywords.some(k => lower.includes(k))) { status = s; break; }
   }
@@ -158,9 +158,9 @@ function scrapeHtml(html, courierName) {
     if (cells.length >= 2 && cells[1].length > 3 && !/^(date|time|status|location|event|description)$/i.test(cells[0])) {
       history.push({
         timestamp: cells[0] || null,
-        message:   cells[1] || null,
-        location:  cells[2] || null,
-        status:    normalizeStatus(cells[1]),
+        message: cells[1] || null,
+        location: cells[2] || null,
+        status: normalizeStatus(cells[1]),
       });
     }
   }
@@ -180,6 +180,169 @@ function scrapeHtml(html, courierName) {
   return { status, location, estimated_delivery: edd, history: history.slice(0, 20) };
 }
 
+function tryParseEkartJson(body) {
+  if (!body) return null;
+
+  try {
+    const data = JSON.parse(body);
+
+    const possibleEvents =
+      data?.ShipmentSummary ||
+      data?.trackDetails ||
+      data?.events ||
+      data?.shipmentTrack ||
+      data?.trackingDetails ||
+      data?.history ||
+      [];
+
+    const events = Array.isArray(possibleEvents) ? possibleEvents : [];
+
+    const currentStatus =
+      data?.currentStatus ||
+      data?.status ||
+      data?.shipmentStatus ||
+      data?.latestStatus ||
+      events?.[events.length - 1]?.status ||
+      events?.[events.length - 1]?.scanType ||
+      events?.[events.length - 1]?.description;
+
+    if (!currentStatus) return null;
+
+    return {
+      status: normalizeStatus(currentStatus),
+      location:
+        data?.currentLocation ||
+        data?.location ||
+        events?.[events.length - 1]?.location ||
+        events?.[events.length - 1]?.city ||
+        null,
+      estimated_delivery:
+        data?.expectedDeliveryDate ||
+        data?.estimatedDelivery ||
+        data?.edd ||
+        null,
+      history: events
+        .map((e) => ({
+          timestamp: e.date || e.timestamp || e.scanDate || e.time || null,
+          message: e.status || e.scanType || e.description || e.activity || null,
+          location: e.location || e.city || e.hub || null,
+          status: normalizeStatus(e.status || e.scanType || e.description || ''),
+        }))
+        .filter((e) => e.message),
+      courier: 'Ekart',
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function scrapeEkartHtml(html) {
+  if (!html || html.length < 100) {
+    return {
+      status: 'Pending',
+      location: null,
+      estimated_delivery: null,
+      history: [],
+      courier: 'Ekart',
+    };
+  }
+
+  const text = html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const lower = text.toLowerCase();
+
+  let status = 'Pending';
+
+  const exactStatusPatterns = [
+    /current\s+status[:\s]+(out\s+for\s+delivery|delivered|in\s+transit|pending|shipment\s+details\s+received|arrived\s+at\s+your\s+nearest\s+hub)/i,
+    /(out\s+for\s+delivery)/i,
+    /(delivered)/i,
+  ];
+
+  for (const pattern of exactStatusPatterns) {
+    const match = text.match(pattern);
+
+    if (match?.[1]) {
+      status = normalizeStatus(match[1]);
+      break;
+    }
+  }
+
+  if (lower.includes('out for delivery')) {
+    status = 'Out for Delivery';
+  } else if (lower.includes('delivered') && !lower.includes('out for delivery')) {
+    status = 'Delivered';
+  } else if (
+    lower.includes('arrived at your nearest hub') ||
+    lower.includes('shipment details received')
+  ) {
+    status = 'In Transit';
+  }
+
+  let estimated_delivery = null;
+
+  const expectedPatterns = [
+    /expected\s+on[:\s]+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
+    /expected\s+on[:\s]+([A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
+    /expected\s+on[:\s]+(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i,
+  ];
+
+  for (const pattern of expectedPatterns) {
+    const match = text.match(pattern);
+
+    if (match?.[1]) {
+      estimated_delivery = match[1].trim();
+      break;
+    }
+  }
+
+  let location = null;
+
+  if (lower.includes('arrived at your nearest hub')) {
+    location = 'Nearest Hub';
+  }
+
+  const history = [];
+
+  if (status === 'Out for Delivery') {
+    history.push({
+      timestamp: null,
+      status: 'Out for Delivery',
+      message: 'Out For Delivery',
+      location: location || null,
+    });
+  } else if (status === 'Delivered') {
+    history.push({
+      timestamp: null,
+      status: 'Delivered',
+      message: 'Delivered',
+      location: location || null,
+    });
+  } else if (status === 'In Transit') {
+    history.push({
+      timestamp: null,
+      status: 'In Transit',
+      message: 'Shipment is in transit',
+      location: location || null,
+    });
+  }
+
+  return {
+    status,
+    location,
+    estimated_delivery,
+    history,
+    courier: 'Ekart',
+  };
+}
+
 // ─── Courier-specific API strategies ─────────────────────────────────────────
 const STRATEGIES = [
 
@@ -188,33 +351,67 @@ const STRATEGIES = [
     name: 'Ekart',
     match: /ekartlogistics\.com/i,
     scrape: async (url) => {
-      // Extract tracking ID from URL
-      const id = url.split('/').filter(Boolean).pop()?.split('?')[0];
-      if (!id) throw new Error('No tracking ID in Ekart URL');
+      const id =
+        url.match(/shipmenttrack\/([A-Z0-9]+)/i)?.[1] ||
+        url.split('/').filter(Boolean).pop()?.split('?')[0];
 
-      // Try Ekart tracking API
-      const apiUrl = `https://ekartlogistics.com/shipmenttrack/${id}`;
-      const res = await fetchUrl(apiUrl, { headers: { 'Accept': 'application/json, text/html' } });
-
-      // Try JSON parse first
-      try {
-        const data = JSON.parse(res.body);
-        const events = data?.ShipmentSummary || data?.trackDetails || data?.events || [];
-        const last   = events[events.length - 1] || {};
-        return {
-          status:             normalizeStatus(last?.status || last?.scanType || data?.status),
-          location:           last?.location || last?.city || null,
-          estimated_delivery: data?.edd || data?.estimatedDelivery || null,
-          history: events.map(e => ({
-            timestamp: e.date || e.timestamp || e.scanDate || null,
-            message:   e.status || e.scanType || e.description || e.activity || null,
-            location:  e.location || e.city || e.hub || null,
-            status:    normalizeStatus(e.status || e.scanType || ''),
-          })).filter(e => e.message),
-        };
-      } catch (_) {
-        return scrapeHtml(res.body, 'Ekart');
+      if (!id) {
+        throw new Error('No tracking ID in Ekart URL');
       }
+
+      const urlsToTry = [
+        url,
+        `https://www.ekartlogistics.com/ekartlogistics-web/shipmenttrack/${id}`,
+        `https://ekartlogistics.com/ekartlogistics-web/shipmenttrack/${id}`,
+        `https://ekartlogistics.com/shipmenttrack/${id}`,
+      ];
+
+      let lastBody = '';
+
+      for (const tryUrl of urlsToTry) {
+        try {
+          const res = await fetchUrl(tryUrl, {
+            headers: {
+              Accept: 'application/json, text/html, */*',
+              Referer: 'https://www.ekartlogistics.com/',
+            },
+          });
+
+          lastBody = res.body || '';
+
+          const jsonResult = tryParseEkartJson(lastBody);
+
+          if (jsonResult && jsonResult.status !== 'Pending') {
+            return jsonResult;
+          }
+
+          const htmlResult = scrapeEkartHtml(lastBody);
+
+          if (htmlResult && htmlResult.status !== 'Pending') {
+            return htmlResult;
+          }
+        } catch (err) {
+          console.warn(`[Ekart] Failed URL ${tryUrl}: ${err.message}`);
+        }
+      }
+
+      const generic = scrapeHtml(lastBody, 'Ekart');
+
+      if (
+        generic.status === 'Out for Delivery' ||
+        generic.status === 'Delivered' ||
+        generic.status === 'Exception'
+      ) {
+        return generic;
+      }
+
+      return {
+        status: 'Pending',
+        location: null,
+        estimated_delivery: null,
+        history: [],
+        courier: 'Ekart',
+      };
     },
   },
 
@@ -224,7 +421,7 @@ const STRATEGIES = [
     match: /delhivery\.com/i,
     scrape: async (url) => {
       const waybill = url.match(/wbn=([A-Z0-9]+)/i)?.[1] ||
-                      url.split('/').filter(Boolean).pop()?.split('?')[0];
+        url.split('/').filter(Boolean).pop()?.split('?')[0];
       if (!waybill) throw new Error('No waybill in Delhivery URL');
 
       const res = await fetchUrl(
@@ -234,18 +431,18 @@ const STRATEGIES = [
 
       try {
         const data = JSON.parse(res.body);
-        const pkg  = data?.ShipmentData?.[0]?.Shipment || {};
+        const pkg = data?.ShipmentData?.[0]?.Shipment || {};
         const scans = (pkg?.Scans || []).reverse();
-        const last  = scans[scans.length - 1]?.ScanDetail || {};
+        const last = scans[scans.length - 1]?.ScanDetail || {};
         return {
-          status:             normalizeStatus(pkg?.Status?.Status || last?.Scan),
-          location:           last?.ScanLocation || pkg?.Status?.ScanLocation || null,
+          status: normalizeStatus(pkg?.Status?.Status || last?.Scan),
+          location: last?.ScanLocation || pkg?.Status?.ScanLocation || null,
           estimated_delivery: pkg?.ExpectedDeliveryDate || null,
           history: scans.map(s => ({
             timestamp: s.ScanDetail?.ScanDateTime || null,
-            message:   s.ScanDetail?.Instructions || s.ScanDetail?.Scan || null,
-            location:  s.ScanDetail?.ScanLocation || null,
-            status:    normalizeStatus(s.ScanDetail?.Scan || ''),
+            message: s.ScanDetail?.Instructions || s.ScanDetail?.Scan || null,
+            location: s.ScanDetail?.ScanLocation || null,
+            status: normalizeStatus(s.ScanDetail?.Scan || ''),
           })).filter(e => e.message),
         };
       } catch (_) {
@@ -261,7 +458,7 @@ const STRATEGIES = [
     match: /shiprocket\.in/i,
     scrape: async (url) => {
       const awb = url.match(/awb=([A-Z0-9]+)/i)?.[1] ||
-                  url.match(/\/tracking\/([A-Z0-9]+)/i)?.[1];
+        url.match(/\/tracking\/([A-Z0-9]+)/i)?.[1];
       if (!awb) throw new Error('No AWB in Shiprocket URL');
 
       const res = await fetchUrl(
@@ -270,19 +467,19 @@ const STRATEGIES = [
       );
 
       try {
-        const data       = JSON.parse(res.body);
-        const tracking   = data?.tracking_data || {};
-        const shipment   = tracking?.shipment_track?.[0] || {};
+        const data = JSON.parse(res.body);
+        const tracking = data?.tracking_data || {};
+        const shipment = tracking?.shipment_track?.[0] || {};
         const activities = (tracking?.shipment_track_activities || []);
         return {
-          status:             normalizeStatus(shipment?.current_status || tracking?.track_status),
-          location:           activities[0]?.location || shipment?.origin || null,
+          status: normalizeStatus(shipment?.current_status || tracking?.track_status),
+          location: activities[0]?.location || shipment?.origin || null,
           estimated_delivery: shipment?.edd || null,
           history: activities.map(a => ({
             timestamp: a.date || null,
-            message:   a.activity || a.status || null,
-            location:  a.location || null,
-            status:    normalizeStatus(a.activity || a.status || ''),
+            message: a.activity || a.status || null,
+            location: a.location || null,
+            status: normalizeStatus(a.activity || a.status || ''),
           })).filter(e => e.message),
         };
       } catch (_) {
@@ -323,18 +520,18 @@ const STRATEGIES = [
       );
 
       try {
-        const data  = JSON.parse(res.body);
+        const data = JSON.parse(res.body);
         const scans = data?.trackingDetails || data?.scanList || [];
-        const last  = scans[scans.length - 1] || {};
+        const last = scans[scans.length - 1] || {};
         return {
-          status:             normalizeStatus(last?.status || last?.scanType),
-          location:           last?.location || last?.city || null,
+          status: normalizeStatus(last?.status || last?.scanType),
+          location: last?.location || last?.city || null,
           estimated_delivery: null,
           history: scans.map(s => ({
             timestamp: s.date || s.time || null,
-            message:   s.status || s.scanType || s.remarks || null,
-            location:  s.location || s.city || null,
-            status:    normalizeStatus(s.status || s.scanType || ''),
+            message: s.status || s.scanType || s.remarks || null,
+            location: s.location || s.city || null,
+            status: normalizeStatus(s.status || s.scanType || ''),
           })).filter(e => e.message),
         };
       } catch (_) {
@@ -350,7 +547,7 @@ const STRATEGIES = [
     match: /ecomexpress\.in/i,
     scrape: async (url) => {
       const awb = url.match(/awb_number=(\d+)/i)?.[1] ||
-                  url.match(/\/tracking\/(\d+)/i)?.[1];
+        url.match(/\/tracking\/(\d+)/i)?.[1];
       if (!awb) throw new Error('No AWB in Ecom Express URL');
 
       const res = await fetchUrl(
@@ -367,7 +564,7 @@ const STRATEGIES = [
     match: /xpressbees\.com/i,
     scrape: async (url) => {
       const awb = url.match(/awb=(\d+)/i)?.[1] ||
-                  url.match(/\/tracking\/(\d+)/i)?.[1];
+        url.match(/\/tracking\/(\d+)/i)?.[1];
       if (!awb) throw new Error('No AWB in Xpressbees URL');
 
       const res = await fetchUrl(
@@ -384,7 +581,7 @@ const STRATEGIES = [
     match: /indiapost\.gov\.in/i,
     scrape: async (url) => {
       const id = url.match(/consignment_id=([A-Z0-9]+)/i)?.[1] ||
-                 url.match(/([A-Z]{2}\d{9}IN)/)?.[1];
+        url.match(/([A-Z]{2}\d{9}IN)/)?.[1];
       if (!id) throw new Error('No consignment ID in India Post URL');
 
       const res = await fetchUrl(
@@ -401,7 +598,7 @@ const STRATEGIES = [
     match: /fedex\.com/i,
     scrape: async (url) => {
       const trackNum = url.match(/tracknumbers=(\d+)/i)?.[1] ||
-                       url.match(/trackingNumber=(\d+)/i)?.[1];
+        url.match(/trackingNumber=(\d+)/i)?.[1];
       if (!trackNum) throw new Error('No tracking number in FedEx URL');
 
       const res = await fetchUrl(
@@ -418,7 +615,7 @@ const STRATEGIES = [
     match: /dhl\.com/i,
     scrape: async (url) => {
       const id = url.match(/tracking-id=([A-Z0-9]+)/i)?.[1] ||
-                 url.match(/\/([A-Z0-9]{10,20})\/?$/i)?.[1];
+        url.match(/\/([A-Z0-9]{10,20})\/?$/i)?.[1];
       if (!id) throw new Error('No tracking ID in DHL URL');
 
       const res = await fetchUrl(
@@ -427,18 +624,18 @@ const STRATEGIES = [
       );
 
       try {
-        const data   = JSON.parse(res.body);
-        const ship   = data?.shipments?.[0] || {};
+        const data = JSON.parse(res.body);
+        const ship = data?.shipments?.[0] || {};
         const events = ship?.events || [];
         return {
-          status:             normalizeStatus(ship?.status?.description || ship?.status?.code),
-          location:           ship?.status?.location?.address?.addressLocality || null,
+          status: normalizeStatus(ship?.status?.description || ship?.status?.code),
+          location: ship?.status?.location?.address?.addressLocality || null,
           estimated_delivery: ship?.estimatedTimeOfDelivery || null,
           history: events.map(e => ({
             timestamp: e.timestamp || null,
-            message:   e.description || e.status || null,
-            location:  e.location?.address?.addressLocality || null,
-            status:    normalizeStatus(e.description || ''),
+            message: e.description || e.status || null,
+            location: e.location?.address?.addressLocality || null,
+            status: normalizeStatus(e.description || ''),
           })).filter(e => e.message),
         };
       } catch (_) {
@@ -478,16 +675,16 @@ async function scrapeTrackingUrl(url) {
   if (strategy) {
     console.log(`[Scraper] Using ${strategy.name} strategy`);
     try {
-      const result   = await strategy.scrape(url);
+      const result = await strategy.scrape(url);
       result.courier = strategy.name;
-      result.status  = normalizeStatus(result.status);
+      result.status = normalizeStatus(result.status);
       result.history = (result.history || []).filter(h => h.message?.length > 2);
       console.log(`[Scraper] ✓ ${strategy.name}: ${result.status} @ ${result.location || 'unknown'}`);
       return result;
     } catch (err) {
       console.warn(`[Scraper] ${strategy.name} failed (${err.message}) — trying direct HTML`);
       try {
-        const res    = await fetchUrl(url);
+        const res = await fetchUrl(url);
         const result = scrapeHtml(res.body, strategy.name);
         result.courier = strategy.name;
         return result;
@@ -502,7 +699,7 @@ async function scrapeTrackingUrl(url) {
   console.log(`[Scraper] Unknown courier — trying generic HTML scrape`);
   const courier = detectCourierFromUrl(url);
   try {
-    const res    = await fetchUrl(url);
+    const res = await fetchUrl(url);
     const result = scrapeHtml(res.body, courier);
     result.courier = courier;
     return result;
