@@ -31,11 +31,11 @@ async function apiFetch(path, opts = {}) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const STATUS_COLORS = {
-  "In Transit":       { bg: "#E6F1FB", text: "#185FA5", border: "#185FA5" },
+  "In Transit": { bg: "#E6F1FB", text: "#185FA5", border: "#185FA5" },
   "Out for Delivery": { bg: "#FAEEDA", text: "#854F0B", border: "#BA7517" },
-  "Delivered":        { bg: "#EAF3DE", text: "#3B6D11", border: "#3B6D11" },
-  "Exception":        { bg: "#FCEBEB", text: "#A32D2D", border: "#A32D2D" },
-  "Pending":          { bg: "#F1EFE8", text: "#5F5E5A", border: "#888780" },
+  "Delivered": { bg: "#EAF3DE", text: "#3B6D11", border: "#3B6D11" },
+  "Exception": { bg: "#FCEBEB", text: "#A32D2D", border: "#A32D2D" },
+  "Pending": { bg: "#F1EFE8", text: "#5F5E5A", border: "#888780" },
 };
 
 const COURIER_COLORS = {
@@ -336,9 +336,12 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
     try {
       setStep(0);
       const [data] = await Promise.all([
-        apiFetch(`/orders/${orderId}/add-tracking`, {
+        apiFetch("/add-tracking", {
           method: "POST",
-          body: JSON.stringify({ tracking_link: url.trim() }),
+          body: JSON.stringify({
+            order_id: orderId,
+            tracking_link: url.trim(),
+          }),
         }),
         simulateSteps(),
       ]);
