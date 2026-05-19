@@ -1,9 +1,17 @@
 const { getSupabase } = require("./lib/supabase");
 const { handleCors } = require("./lib/cors");
 const { parseTrackingLink, detectCourierFromUrl } = require("./lib/parser");
+const { scrapeTrackingUrl } = require("./lib/scraper");
 
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
+
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, proxy-revalidate"
+  );
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
 
   if (req.method !== "POST") {
     return res.status(405).json({
@@ -54,20 +62,38 @@ module.exports = async (req, res) => {
     }
 
     const parsed = parseTrackingLink(cleanLink);
-    const tracking_id = parsed.tracking_id || extractIdFromUrl(cleanLink);
-    const courier = parsed.courier || detectCourierFromUrl(cleanLink);
+    const trackingIdFromUrl = parsed.tracking_id || extractIdFromUrl(cleanLink);
+    const courierFromUrl = parsed.courier || detectCourierFromUrl(cleanLink);
+
+    let scraped = {
+      status: "Pending",
+      location: null,
+      estimated_delivery: null,
+      history: [],
+      courier: courierFromUrl,
+    };
+
+    try {
+      scraped = await scrapeTrackingUrl(cleanLink);
+    } catch (scrapeError) {
+      console.warn("[add-tracking scrape failed]", scrapeError.message);
+    }
+
+    const finalStatus = normalizeAppStatus(scraped.status || "Pending");
+    const finalCourier = scraped.courier || courierFromUrl;
+    const finalTrackingId = trackingIdFromUrl;
 
     const { error: upsertError } = await supabase.from("shipments").upsert(
       {
         order_id: cleanOrderId,
-        tracking_id,
-        courier,
+        tracking_id: finalTrackingId,
+        courier: finalCourier,
         tracking_link: cleanLink,
-        last_status: "Pending",
-        current_location: null,
-        estimated_delivery: null,
+        last_status: finalStatus,
+        current_location: scraped.location || null,
+        estimated_delivery: normalizeDate(scraped.estimated_delivery),
         last_updated: new Date().toISOString(),
-        raw_history: [],
+        raw_history: Array.isArray(scraped.history) ? scraped.history : [],
       },
       {
         onConflict: "order_id",
@@ -84,9 +110,12 @@ module.exports = async (req, res) => {
     return res.status(201).json({
       message: "Tracking link saved successfully",
       order_id: cleanOrderId,
-      tracking_id,
-      courier,
-      status: "Pending",
+      tracking_id: finalTrackingId,
+      courier: finalCourier,
+      status: finalStatus,
+      current_location: scraped.location || null,
+      estimated_delivery: normalizeDate(scraped.estimated_delivery),
+      history: Array.isArray(scraped.history) ? scraped.history : [],
       tracking_link: cleanLink,
     });
   } catch (err) {
@@ -119,4 +148,65 @@ function extractIdFromUrl(url) {
   } catch (_) {}
 
   return "UNKNOWN";
+}
+
+function normalizeDate(value) {
+  if (!value) return null;
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date.toISOString().split("T")[0];
+}
+
+function normalizeAppStatus(status) {
+  if (!status) return "Pending";
+
+  const s = String(status).toLowerCase();
+
+  if (s.includes("delivered") && !s.includes("out")) {
+    return "Delivered";
+  }
+
+  if (
+    s.includes("out for delivery") ||
+    s.includes("out-for-delivery") ||
+    s.includes("ofd") ||
+    s.includes("with delivery agent")
+  ) {
+    return "Out for Delivery";
+  }
+
+  if (
+    s.includes("transit") ||
+    s.includes("reached") ||
+    s.includes("arrived") ||
+    s.includes("departed") ||
+    s.includes("hub")
+  ) {
+    return "In Transit";
+  }
+
+  if (
+    s.includes("exception") ||
+    s.includes("failed") ||
+    s.includes("attempted") ||
+    s.includes("undelivered")
+  ) {
+    return "Exception";
+  }
+
+  if (
+    s.includes("pending") ||
+    s.includes("created") ||
+    s.includes("info received") ||
+    s.includes("booked")
+  ) {
+    return "Pending";
+  }
+
+  return status;
 }
