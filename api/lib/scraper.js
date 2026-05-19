@@ -1,207 +1,337 @@
+/**
+ * Lightweight HTTP-based tracking scraper
+ * Works on Vercel free tier — no Puppeteer, no browser
+ * Calls courier APIs/JSON endpoints directly
+ */
+
+const https = require('https');
+const http = require('http');
 const { detectCourierFromUrl } = require('./parser');
 
-const PAGE_TIMEOUT  = 25000;
-const WAIT_AFTER_LOAD = 3000;
+// ─── HTTP fetch helper ────────────────────────────────────────────────────────
+function fetchUrl(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.request(url, {
+      method: options.method || 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/html, */*',
+        'Accept-Language': 'en-IN,en;q=0.9',
+        'Referer': url,
+        ...options.headers,
+      },
+      timeout: 8000,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
 
-// ─── Courier-specific scraping strategies ─────────────────────────────────────
+// ─── Courier strategies — direct API calls ────────────────────────────────────
 const STRATEGIES = [
+
+  // ── Ekart / Flipkart ────────────────────────────────────────────────────────
   {
-    name: 'Delhivery', match: /delhivery\.com/i,
-    scrape: async (page, url) => {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-      await page.waitForSelector('[class*="status"], [class*="tracking"]', { timeout: 8000 }).catch(() => {});
-      await sleep(WAIT_AFTER_LOAD);
-      return page.evaluate(() => {
-        const getText = s => document.querySelector(s)?.innerText?.trim() || null;
-        const status   = getText('[class*="status-text"]') || getText('[class*="current-status"]') || inferStatus();
-        const location = getText('[class*="current-location"]') || getText('[class*="location"]');
-        const edd      = getText('[class*="expected-delivery"]') || getText('[class*="estimated"]');
-        const history  = [];
-        document.querySelectorAll('[class*="track-event"],[class*="timeline-item"],[class*="checkpoint"]').forEach(el => {
-          const msg  = el.querySelector('[class*="message"],[class*="status"],p,span')?.innerText?.trim();
-          const time = el.querySelector('[class*="time"],[class*="date"],time')?.innerText?.trim();
-          const loc  = el.querySelector('[class*="location"],[class*="city"]')?.innerText?.trim();
-          if (msg) history.push({ message: msg, timestamp: time || null, location: loc || null });
-        });
-        function inferStatus() {
-          const b = document.body.innerText.toLowerCase();
-          if (b.includes('delivered')) return 'Delivered';
-          if (b.includes('out for delivery')) return 'Out for Delivery';
-          if (b.includes('in transit')) return 'In Transit';
-          return 'In Transit';
-        }
-        return { status, location, estimated_delivery: edd, history };
+    name: 'Ekart',
+    match: /ekartlogistics\.com/i,
+    scrape: async (url) => {
+      const trackingId = url.match(/\/([A-Z0-9]{10,25})\/?$/i)?.[1] ||
+                         url.match(/track[=\/]([A-Z0-9]{10,25})/i)?.[1];
+      if (!trackingId) throw new Error('Could not extract Ekart tracking ID');
+
+      const apiUrl = `https://api.ekartlogistics.com/v2/shipments/${trackingId}`;
+      const res = await fetchUrl(apiUrl, {
+        headers: { 'Accept': 'application/json' }
       });
+
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) {
+        // Fallback: parse HTML page
+        return parseHtmlFallback(res.body, 'Ekart');
+      }
+
+      const shipment = data?.shipment || data?.data || data;
+      const events   = shipment?.events || shipment?.trackingDetails || [];
+
+      return {
+        status:             normalizeStatus(shipment?.status || shipment?.currentStatus),
+        location:           shipment?.currentLocation || events[0]?.location || null,
+        estimated_delivery: shipment?.estimatedDelivery || null,
+        history: events.map(e => ({
+          timestamp: e.timestamp || e.time || null,
+          message:   e.description || e.status || e.message || null,
+          location:  e.location || e.city || null,
+        })).filter(e => e.message),
+      };
     },
   },
+
+  // ── Delhivery ───────────────────────────────────────────────────────────────
   {
-    name: 'BlueDart', match: /bluedart\.com/i,
-    scrape: async (page, url) => {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-      await sleep(WAIT_AFTER_LOAD);
-      return page.evaluate(() => {
-        const getText = s => document.querySelector(s)?.innerText?.trim() || null;
-        const status   = getText('#divShipmentStatus') || getText('[class*="status"]') || inferStatus();
-        const location = getText('#divCurrentLocation') || getText('[class*="location"]');
-        const edd      = getText('#divEDD') || getText('[class*="delivery-date"]');
-        const history  = [];
-        document.querySelectorAll('table tr').forEach((row, i) => {
-          if (i === 0) return;
-          const cells = row.querySelectorAll('td');
-          if (cells.length >= 2) history.push({ timestamp: cells[0]?.innerText?.trim(), message: cells[1]?.innerText?.trim(), location: cells[2]?.innerText?.trim() || null });
-        });
-        function inferStatus() {
-          const b = document.body.innerText.toLowerCase();
-          if (b.includes('delivered')) return 'Delivered';
-          if (b.includes('out for delivery')) return 'Out for Delivery';
-          return 'In Transit';
-        }
-        return { status, location, estimated_delivery: edd, history };
+    name: 'Delhivery',
+    match: /delhivery\.com/i,
+    scrape: async (url) => {
+      const waybill = url.match(/wbn=([A-Z0-9]+)/i)?.[1] ||
+                      url.match(/\/([A-Z0-9]{10,20})\/?$/i)?.[1];
+      if (!waybill) throw new Error('Could not extract Delhivery waybill');
+
+      const apiUrl = `https://api.delhivery.com/v3/track?wbn=${waybill}`;
+      const res = await fetchUrl(apiUrl, {
+        headers: { 'Accept': 'application/json' }
       });
+
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) {
+        return parseHtmlFallback(res.body, 'Delhivery');
+      }
+
+      const pkg      = data?.ShipmentData?.[0]?.Shipment || data?.data?.[0] || {};
+      const scans    = pkg?.Scans || pkg?.scans || [];
+      const status   = pkg?.Status?.Status || pkg?.status || 'In Transit';
+
+      return {
+        status: normalizeStatus(status),
+        location: pkg?.Status?.ScanLocation || scans[0]?.ScanDetail?.ScanLocation || null,
+        estimated_delivery: pkg?.ExpectedDeliveryDate || null,
+        history: scans.map(s => ({
+          timestamp: s.ScanDetail?.ScanDateTime || null,
+          message:   s.ScanDetail?.Instructions || s.ScanDetail?.Scan || null,
+          location:  s.ScanDetail?.ScanLocation || null,
+        })).filter(e => e.message),
+      };
     },
   },
+
+  // ── Shiprocket tracking page ─────────────────────────────────────────────
   {
-    name: 'FedEx', match: /fedex\.com/i,
-    scrape: async (page, url) => {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-      await page.waitForSelector('[data-testid="tracking-status"],[class*="StatusHeader"]', { timeout: 12000 }).catch(() => {});
-      await sleep(WAIT_AFTER_LOAD);
-      return page.evaluate(() => {
-        const getText = s => document.querySelector(s)?.innerText?.trim() || null;
-        const status   = getText('[data-testid="tracking-status"]') || getText('[class*="StatusHeader"]') || inferStatus();
-        const location = getText('[data-testid="current-location"]') || getText('[class*="current-location"]');
-        const edd      = getText('[data-testid="estimated-delivery"]') || getText('[class*="estimated-delivery"]');
-        const history  = [];
-        document.querySelectorAll('[data-testid="travel-history-item"],[class*="TravelHistory"] li').forEach(el => {
-          history.push({ timestamp: el.querySelector('time,[class*="date"]')?.innerText?.trim() || null, message: el.querySelector('[class*="activity"],p')?.innerText?.trim() || el.innerText?.trim(), location: el.querySelector('[class*="location"]')?.innerText?.trim() || null });
-        });
-        function inferStatus() {
-          const b = document.body.innerText.toLowerCase();
-          if (b.includes('delivered')) return 'Delivered';
-          if (b.includes('out for delivery')) return 'Out for Delivery';
-          return 'In Transit';
-        }
-        return { status, location, estimated_delivery: edd, history };
+    name: 'Shiprocket',
+    match: /shiprocket\.in/i,
+    scrape: async (url) => {
+      const awb = url.match(/awb=([A-Z0-9]+)/i)?.[1] ||
+                  url.match(/\/tracking\/([A-Z0-9]+)/i)?.[1];
+      if (!awb) throw new Error('Could not extract Shiprocket AWB');
+
+      const apiUrl = `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awb}`;
+      const res = await fetchUrl(apiUrl, {
+        headers: { 'Accept': 'application/json' }
       });
+
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) {
+        return parseHtmlFallback(res.body, 'Shiprocket');
+      }
+
+      const tracking  = data?.tracking_data || {};
+      const shipment  = tracking?.shipment_track?.[0] || {};
+      const activities = tracking?.shipment_track_activities || [];
+
+      return {
+        status:             normalizeStatus(shipment?.current_status || tracking?.track_status),
+        location:           shipment?.origin || activities[0]?.location || null,
+        estimated_delivery: shipment?.edd || null,
+        history: activities.map(a => ({
+          timestamp: a.date || null,
+          message:   a.activity || a.status || null,
+          location:  a.location || null,
+        })).filter(e => e.message),
+      };
     },
   },
+
+  // ── BlueDart ─────────────────────────────────────────────────────────────
   {
-    name: 'India Post', match: /indiapost\.gov\.in/i,
-    scrape: async (page, url) => {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-      await sleep(WAIT_AFTER_LOAD);
-      return page.evaluate(() => {
-        const history = [];
-        document.querySelectorAll('#table1 tr,table tr').forEach((row, i) => {
-          if (i === 0) return;
-          const cells = row.querySelectorAll('td');
-          if (cells.length >= 2) history.push({ timestamp: cells[0]?.innerText?.trim(), message: cells[1]?.innerText?.trim(), location: cells[2]?.innerText?.trim() || null });
-        });
-        const last = history[history.length - 1];
-        const b = document.body.innerText.toLowerCase();
-        const status = b.includes('delivered') ? 'Delivered' : b.includes('out for delivery') ? 'Out for Delivery' : 'In Transit';
-        return { status, location: last?.location || null, estimated_delivery: null, history };
-      });
+    name: 'BlueDart',
+    match: /bluedart\.com/i,
+    scrape: async (url) => {
+      const waybill = url.match(/waybill=(\d+)/i)?.[1] ||
+                      url.match(/\/(\d{10,12})\/?$/)?.[1];
+      if (!waybill) throw new Error('Could not extract BlueDart waybill');
+
+      const apiUrl = `https://api.bluedart.com/servlet/RoutingServlet?handler=tnt&action=custracdtl&colno=${waybill}&checktnt=Y&Type=S&subType=&addtnlType=`;
+      const res = await fetchUrl(apiUrl);
+      return parseHtmlFallback(res.body, 'BlueDart');
     },
   },
+
+  // ── FedEx ─────────────────────────────────────────────────────────────────
+  {
+    name: 'FedEx',
+    match: /fedex\.com/i,
+    scrape: async (url) => {
+      const trackNum = url.match(/tracknumbers=(\d+)/i)?.[1] ||
+                       url.match(/trackingNumber=(\d+)/i)?.[1];
+      if (!trackNum) throw new Error('Could not extract FedEx tracking number');
+
+      const apiUrl = `https://apis.fedex.com/track/v1/trackingnumbers`;
+      const res = await fetchUrl(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trackingInfo: [{ trackingNumberInfo: { trackingNumber: trackNum } }] }),
+      });
+
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) {
+        return parseHtmlFallback(res.body, 'FedEx');
+      }
+
+      const pkg    = data?.output?.completeTrackResults?.[0]?.trackResults?.[0];
+      const events = pkg?.dateAndTimes || [];
+      const scans  = pkg?.scanEvents || [];
+
+      return {
+        status:             normalizeStatus(pkg?.latestStatusDetail?.description),
+        location:           pkg?.latestStatusDetail?.scanLocation?.city || null,
+        estimated_delivery: pkg?.estimatedDeliveryTimeWindow?.window?.ends || null,
+        history: scans.map(s => ({
+          timestamp: s.date || null,
+          message:   s.eventDescription || null,
+          location:  [s.scanLocation?.city, s.scanLocation?.stateOrProvinceCode].filter(Boolean).join(', ') || null,
+        })).filter(e => e.message),
+      };
+    },
+  },
+
+  // ── India Post ───────────────────────────────────────────────────────────
+  {
+    name: 'India Post',
+    match: /indiapost\.gov\.in/i,
+    scrape: async (url) => {
+      const consignmentId = url.match(/consignment_id=([A-Z0-9]+)/i)?.[1] ||
+                            url.match(/([A-Z]{2}\d{9}IN)/)?.[1];
+      if (!consignmentId) throw new Error('Could not extract India Post consignment ID');
+
+      const apiUrl = `https://www.indiapost.gov.in/_layouts/15/dop.portal.tracking/trackconsignment.aspx`;
+      const res = await fetchUrl(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `consignmentNo=${consignmentId}&captchaCode=`,
+      });
+
+      return parseHtmlFallback(res.body, 'India Post');
+    },
+  },
+
+  // ── DTDC ─────────────────────────────────────────────────────────────────
+  {
+    name: 'DTDC',
+    match: /dtdc\.com/i,
+    scrape: async (url) => {
+      const trackNum = url.match(/trackingno=([A-Z0-9]+)/i)?.[1];
+      if (!trackNum) throw new Error('Could not extract DTDC tracking number');
+
+      const apiUrl = `https://tracking.dtdc.com/ctbs-tracking/customerInterface.tr?submitName=getLoadPgFrmExternal&cnNo=${trackNum}&cType=JSON`;
+      const res = await fetchUrl(apiUrl);
+
+      let data;
+      try { data = JSON.parse(res.body); } catch (_) {
+        return parseHtmlFallback(res.body, 'DTDC');
+      }
+
+      const scans = data?.trackingDetails || data?.scanDetails || [];
+      const last  = scans[scans.length - 1] || {};
+
+      return {
+        status:             normalizeStatus(last?.status || last?.scanType),
+        location:           last?.location || last?.city || null,
+        estimated_delivery: null,
+        history: scans.map(s => ({
+          timestamp: s.date || s.time || null,
+          message:   s.status || s.scanType || s.remarks || null,
+          location:  s.location || s.city || null,
+        })).filter(e => e.message),
+      };
+    },
+  },
+
 ];
 
-// ─── Generic fallback ─────────────────────────────────────────────────────────
-async function genericScrape(page, url) {
-  await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-  await sleep(WAIT_AFTER_LOAD);
-  return page.evaluate(() => {
-    const b = document.body.innerText.toLowerCase();
-    let status = 'In Transit';
-    if (b.includes('delivered') && !b.includes('out for delivery')) status = 'Delivered';
-    else if (b.includes('out for delivery')) status = 'Out for Delivery';
-    else if (b.includes('exception') || b.includes('failed delivery')) status = 'Exception';
+// ─── HTML fallback parser ─────────────────────────────────────────────────────
+// When JSON API is unavailable, parse raw HTML for keywords
+function parseHtmlFallback(html, courierName) {
+  if (!html) return { status: 'Pending', location: null, estimated_delivery: null, history: [] };
 
-    let location = null;
-    for (const s of ['[class*="location"]','[class*="city"]','[id*="location"]']) {
-      const el = document.querySelector(s);
-      if (el?.innerText?.trim()) { location = el.innerText.trim(); break; }
+  const text = html.toLowerCase();
+
+  let status = 'In Transit';
+  if (text.includes('delivered')) status = 'Delivered';
+  else if (text.includes('out for delivery')) status = 'Out for Delivery';
+  else if (text.includes('exception') || text.includes('failed delivery')) status = 'Exception';
+  else if (text.includes('picked up') || text.includes('pickup')) status = 'Picked Up';
+  else if (text.includes('in transit') || text.includes('intransit')) status = 'In Transit';
+
+  // Try to extract location
+  let location = null;
+  const locMatch = html.match(/(?:current.{0,20}location|at|reached)[^<]{0,5}[>:]?\s*([A-Z][a-zA-Z\s,]{3,30})</i);
+  if (locMatch) location = locMatch[1].trim();
+
+  // Try to extract EDD
+  let edd = null;
+  const eddMatch = html.match(/(?:expected|estimated).{0,20}delivery.{0,20}(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}|\d{1,2}\s+\w{3}\s+\d{4})/i);
+  if (eddMatch) edd = eddMatch[1];
+
+  // Try to build history from table rows
+  const history = [];
+  const rowMatches = html.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
+  for (const row of rowMatches) {
+    const cells = [...row[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map(c =>
+      c[1].replace(/<[^>]+>/g, '').trim()
+    ).filter(Boolean);
+    if (cells.length >= 2 && cells[1].length > 3) {
+      history.push({ timestamp: cells[0] || null, message: cells[1] || null, location: cells[2] || null });
     }
+  }
 
-    const history = [];
-    document.querySelectorAll('table tr').forEach((row, i) => {
-      if (i === 0) return;
-      const cells = row.querySelectorAll('td');
-      if (cells.length >= 2) history.push({ timestamp: cells[0]?.innerText?.trim(), message: cells[1]?.innerText?.trim(), location: cells[2]?.innerText?.trim() || null });
-    });
-
-    if (!history.length) {
-      document.querySelectorAll('[class*="timeline"] li,[class*="track"] li').forEach(li => {
-        history.push({ timestamp: li.querySelector('time,[class*="date"]')?.innerText?.trim() || null, message: li.innerText?.trim(), location: null });
-      });
-    }
-
-    return { status, location, estimated_delivery: null, history };
-  });
+  return { status, location, estimated_delivery: edd, history };
 }
 
 // ─── Main exported function ───────────────────────────────────────────────────
 async function scrapeTrackingUrl(url) {
-  // Use @sparticuz/chromium on Vercel, local chromium otherwise
-  let browser;
-  try {
-    if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
-      const chromium = require('@sparticuz/chromium');
-      const puppeteer = require('puppeteer-core');
-      browser = await puppeteer.launch({
-        args: chromium.args,
-        defaultViewport: chromium.defaultViewport,
-        executablePath: await chromium.executablePath(),
-        headless: chromium.headless,
-      });
-    } else {
-      const puppeteer = require('puppeteer');
-      browser = await puppeteer.launch({
-        headless: 'new',
-        args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu'],
-      });
+  const strategy = STRATEGIES.find(s => s.match.test(url));
+
+  if (strategy) {
+    console.log(`[Scraper] Using ${strategy.name} strategy for: ${url}`);
+    try {
+      const result = await strategy.scrape(url);
+      result.courier  = strategy.name;
+      result.status   = normalizeStatus(result.status);
+      result.history  = (result.history || []).filter(h => h.message?.length > 2);
+      return result;
+    } catch (err) {
+      console.warn(`[Scraper] ${strategy.name} API failed: ${err.message} — trying HTML fallback`);
+      const res = await fetchUrl(url).catch(() => ({ body: '' }));
+      const result = parseHtmlFallback(res.body, strategy.name);
+      result.courier = strategy.name;
+      return result;
     }
-
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      if (['image','font','media'].includes(req.resourceType())) req.abort();
-      else req.continue();
-    });
-
-    const strategy = STRATEGIES.find(s => s.match.test(url));
-    let result;
-
-    if (strategy) {
-      console.log(`[Scraper] Using ${strategy.name} strategy`);
-      result = await strategy.scrape(page, url);
-    } else {
-      console.log(`[Scraper] Using generic strategy`);
-      result = await genericScrape(page, url);
-    }
-
-    result.history  = (result.history || []).filter(h => h.message?.length > 2);
-    result.status   = normalizeStatus(result.status);
-    result.courier  = strategy?.name || detectCourierFromUrl(url);
-    return result;
-
-  } finally {
-    if (browser) await browser.close();
   }
+
+  // Unknown courier — fetch the page and parse HTML
+  console.log(`[Scraper] Unknown courier, using HTML fallback for: ${url}`);
+  const courier = detectCourierFromUrl(url);
+  const res = await fetchUrl(url).catch(() => ({ body: '' }));
+  const result = parseHtmlFallback(res.body, courier);
+  result.courier = courier;
+  return result;
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function normalizeStatus(raw) {
   if (!raw) return 'In Transit';
   const s = raw.toLowerCase();
   if (s.includes('delivered') && !s.includes('out for')) return 'Delivered';
-  if (s.includes('out for delivery')) return 'Out for Delivery';
-  if (s.includes('in transit') || s.includes('intransit')) return 'In Transit';
-  if (s.includes('exception') || s.includes('failed')) return 'Exception';
+  if (s.includes('out for delivery') || s.includes('out_for_delivery')) return 'Out for Delivery';
+  if (s.includes('in transit') || s.includes('intransit') || s.includes('in_transit')) return 'In Transit';
+  if (s.includes('exception') || s.includes('failed') || s.includes('undelivered')) return 'Exception';
   if (s.includes('picked up') || s.includes('pickup')) return 'Picked Up';
+  if (s.includes('booked') || s.includes('created') || s.includes('info')) return 'Info Received';
   return raw;
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 module.exports = { scrapeTrackingUrl };
