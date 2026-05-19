@@ -1,0 +1,17 @@
+{
+  "name": "shiptrack",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "npm --prefix frontend install && npm --prefix frontend run build"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^119.0.2",
+    "@supabase/supabase-js": "^2.39.0",
+    "puppeteer-core": "^21.6.1"
+  },
+  "devDependencies": {
+    "vercel": "^33.0.0"
+  }
+}
