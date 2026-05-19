@@ -1,199 +1,251 @@
-const { getSupabase }       = require('../../lib/supabase');
-const { handleCors }        = require('../../lib/cors');
-const { parseTrackingLink, detectCourierFromUrl } = require('../../lib/parser');
-const { scrapeTrackingUrl } = require('../../lib/scraper');
+const { getSupabase } = require('../lib/supabase');
+const { handleCors } = require('../lib/cors');
+const { parseTrackingLink, detectCourierFromUrl } = require('../lib/parser');
+const { scrapeTrackingUrl } = require('../lib/scraper');
 
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
-  const pathParts = Array.isArray(req.query.order_path)
-    ? req.query.order_path
-    : String(req.query.order_path || '').split('/').filter(Boolean);
+  try {
+    const pathParts = Array.isArray(req.query.order_path)
+      ? req.query.order_path
+      : String(req.query.order_path || '').split('/').filter(Boolean);
 
-  const order_id = pathParts[0];
-  const action = pathParts[1] || null;
+    const order_id = pathParts[0];
+    const action = pathParts[1] || null;
 
-  if (!order_id) {
-    return res.status(400).json({ error: 'order_id is required' });
+    if (!order_id) {
+      return res.status(400).json({ error: 'order_id is required' });
+    }
+
+    if (req.method === 'GET' && !action) return getOrder(req, res, order_id);
+    if (req.method === 'POST' && action === 'add-tracking') return addTracking(req, res, order_id);
+    if (req.method === 'POST' && action === 'refresh-tracking') return refreshTracking(req, res, order_id);
+    if (req.method === 'PUT' && action === 'update-tracking') return updateTracking(req, res, order_id);
+    if (req.method === 'DELETE' && !action) return deleteTracking(req, res, order_id);
+
+    return res.status(404).json({ error: 'Route not found' });
+  } catch (err) {
+    console.error('[orders route error]', err);
+    return res.status(500).json({
+      error: 'Internal server error',
+      details: err.message,
+    });
   }
-
-  // Supported routes:
-  // GET    /api/orders/:order_id
-  // POST   /api/orders/:order_id/add-tracking
-  // POST   /api/orders/:order_id/refresh-tracking
-  // PUT    /api/orders/:order_id/update-tracking
-  // DELETE /api/orders/:order_id
-  if (req.method === 'GET' && !action) return getOrder(req, res, order_id);
-  if (req.method === 'POST' && action === 'add-tracking') return addTracking(req, res, order_id);
-  if (req.method === 'POST' && action === 'refresh-tracking') return refreshTracking(req, res, order_id);
-  if (req.method === 'PUT' && action === 'update-tracking') return updateTracking(req, res, order_id);
-  if (req.method === 'DELETE' && !action) return deleteTracking(req, res, order_id);
-
-  return res.status(404).json({ error: 'Route not found' });
 };
 
-// ─── GET single order ─────────────────────────────────────────────────────────
 async function getOrder(req, res, order_id) {
   const supabase = getSupabase();
+
   const { data, error } = await supabase
     .from('orders')
-    .select(`order_id, customer_name, items, created_at, shipments(*)`)
+    .select('order_id, customer_name, items, created_at, shipments(*)')
     .eq('order_id', order_id)
     .single();
-  if (error || !data) return res.status(404).json({ error: 'Order not found' });
-  res.json(formatOrder(data));
+
+  if (error || !data) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
+
+  return res.json({ order: formatOrder(data) });
 }
 
-// ─── POST add-tracking ────────────────────────────────────────────────────────
 async function addTracking(req, res, order_id) {
   const { tracking_link } = req.body || {};
-  if (!tracking_link) return res.status(400).json({ error: 'tracking_link is required' });
 
-  try { new URL(tracking_link.trim()); }
-  catch (_) { return res.status(422).json({ error: 'Invalid URL — paste the full https:// link from the courier website' }); }
+  if (!tracking_link) {
+    return res.status(400).json({ error: 'tracking_link is required' });
+  }
+
+  const cleanLink = tracking_link.trim();
+
+  try {
+    new URL(cleanLink);
+  } catch (_) {
+    return res.status(422).json({
+      error: 'Invalid URL — paste the full https:// link from the courier website',
+    });
+  }
 
   const supabase = getSupabase();
 
-  // Check order exists
-  const { data: order } = await supabase.from('orders').select('order_id').eq('order_id', order_id).single();
-  if (!order) return res.status(404).json({ error: 'Order not found' });
+  const { data: order, error: orderError } = await supabase
+    .from('orders')
+    .select('order_id')
+    .eq('order_id', order_id)
+    .single();
 
-  // Check for duplicate
-  const { data: existing } = await supabase.from('shipments').select('tracking_id').eq('order_id', order_id).single();
-  if (existing) return res.status(409).json({ error: 'Tracking already added for this order', tip: 'Use update-tracking to replace it' });
+  if (orderError || !order) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
 
-  try {
-    const scraped    = await scrapeTrackingUrl(tracking_link.trim());
-    const parsed     = parseTrackingLink(tracking_link.trim());
-    const tracking_id = parsed.tracking_id || extractIdFromUrl(tracking_link);
+  const parsed = parseTrackingLink(cleanLink);
+  const tracking_id = parsed.tracking_id || extractIdFromUrl(cleanLink);
+  const courier = parsed.courier || detectCourierFromUrl(cleanLink);
 
-    const { error: insertErr } = await supabase.from('shipments').insert({
+  const { error: upsertError } = await supabase.from('shipments').upsert(
+    {
       order_id,
       tracking_id,
-      courier:            scraped.courier,
-      tracking_link:      tracking_link.trim(),
-      last_status:        scraped.status,
-      current_location:   scraped.location,
-      estimated_delivery: scraped.estimated_delivery,
-      last_updated:       new Date().toISOString(),
-      raw_history:        scraped.history || [],
-    });
+      courier,
+      tracking_link: cleanLink,
+      last_status: 'Pending',
+      current_location: null,
+      estimated_delivery: null,
+      last_updated: new Date().toISOString(),
+      raw_history: [],
+    },
+    { onConflict: 'order_id' }
+  );
 
-    if (insertErr) throw insertErr;
-
-    res.status(201).json({
-      order_id, tracking_id, courier: scraped.courier,
-      status: scraped.status, estimated_delivery: scraped.estimated_delivery,
-      current_location: scraped.location, history: scraped.history,
-      last_updated: new Date().toISOString(), source: 'scraped',
-    });
-
-  } catch (err) {
-    console.error('[add-tracking] scrape failed:', err.message);
-    // Save URL anyway — will retry on next refresh
-    const parsed = parseTrackingLink(tracking_link.trim());
-    await supabase.from('shipments').upsert({
-      order_id,
-      tracking_id:   parsed.tracking_id || 'UNKNOWN',
-      courier:       parsed.courier     || detectCourierFromUrl(tracking_link),
-      tracking_link: tracking_link.trim(),
-      last_status:   'Pending',
-      last_updated:  new Date().toISOString(),
-      raw_history:   [],
-    }, { onConflict: 'order_id', ignoreDuplicates: true });
-
-    res.status(202).json({
-      order_id, status: 'Pending',
-      message: 'Tracking URL saved. Scraping failed — refresh to retry.',
-      error: err.message,
+  if (upsertError) {
+    return res.status(500).json({
+      error: 'Failed to save tracking link',
+      details: upsertError.message,
     });
   }
+
+  return res.status(201).json({
+    order_id,
+    tracking_id,
+    courier,
+    status: 'Pending',
+    tracking_link: cleanLink,
+    message: 'Tracking link saved successfully. Click refresh tracking to try scraping latest status.',
+  });
 }
 
-// ─── PUT update-tracking ──────────────────────────────────────────────────────
 async function updateTracking(req, res, order_id) {
-  const { tracking_link } = req.body || {};
-  if (!tracking_link) return res.status(400).json({ error: 'tracking_link is required' });
-  try { new URL(tracking_link.trim()); } catch (_) { return res.status(422).json({ error: 'Invalid URL' }); }
-
-  try {
-    const supabase   = getSupabase();
-    const scraped    = await scrapeTrackingUrl(tracking_link.trim());
-    const parsed     = parseTrackingLink(tracking_link.trim());
-
-    const { error } = await supabase.from('shipments').upsert({
-      order_id,
-      tracking_id:        parsed.tracking_id || extractIdFromUrl(tracking_link),
-      courier:            scraped.courier,
-      tracking_link:      tracking_link.trim(),
-      last_status:        scraped.status,
-      current_location:   scraped.location,
-      estimated_delivery: scraped.estimated_delivery,
-      last_updated:       new Date().toISOString(),
-      raw_history:        scraped.history || [],
-    }, { onConflict: 'order_id' });
-
-    if (error) throw error;
-    res.json({ order_id, status: scraped.status, courier: scraped.courier, current_location: scraped.location, history: scraped.history });
-  } catch (err) {
-    res.status(502).json({ error: 'Scraping failed', details: err.message });
-  }
+  return addTracking(req, res, order_id);
 }
 
-// ─── POST refresh-tracking ────────────────────────────────────────────────────
 async function refreshTracking(req, res, order_id) {
   const supabase = getSupabase();
-  const { data: shipment } = await supabase.from('shipments').select('*').eq('order_id', order_id).single();
-  if (!shipment) return res.status(404).json({ error: 'No tracking found for this order' });
+
+  const { data: shipment, error } = await supabase
+    .from('shipments')
+    .select('*')
+    .eq('order_id', order_id)
+    .single();
+
+  if (error || !shipment) {
+    return res.status(404).json({ error: 'No tracking found for this order' });
+  }
 
   try {
     const scraped = await scrapeTrackingUrl(shipment.tracking_link);
-    await supabase.from('shipments').update({
-      last_status:        scraped.status,
-      current_location:   scraped.location,
-      estimated_delivery: scraped.estimated_delivery,
-      last_updated:       new Date().toISOString(),
-      raw_history:        scraped.history || [],
-    }).eq('order_id', order_id);
 
-    res.json({ order_id, tracking_id: shipment.tracking_id, courier: scraped.courier || shipment.courier, status: scraped.status, current_location: scraped.location, history: scraped.history, last_updated: new Date().toISOString() });
+    const { error: updateError } = await supabase
+      .from('shipments')
+      .update({
+        courier: scraped.courier || shipment.courier,
+        last_status: scraped.status || shipment.last_status || 'Pending',
+        current_location: scraped.location || null,
+        estimated_delivery: scraped.estimated_delivery || null,
+        last_updated: new Date().toISOString(),
+        raw_history: scraped.history || [],
+      })
+      .eq('order_id', order_id);
+
+    if (updateError) {
+      return res.status(500).json({
+        error: 'Failed to update tracking data',
+        details: updateError.message,
+      });
+    }
+
+    return res.json({
+      order_id,
+      tracking_id: shipment.tracking_id,
+      courier: scraped.courier || shipment.courier,
+      status: scraped.status || shipment.last_status || 'Pending',
+      current_location: scraped.location || null,
+      estimated_delivery: scraped.estimated_delivery || null,
+      history: scraped.history || [],
+      last_updated: new Date().toISOString(),
+      source: 'scraped',
+    });
   } catch (err) {
-    res.status(502).json({ error: 'Re-scrape failed', details: err.message, last_known_status: shipment.last_status });
+    console.error('[refresh-tracking] scrape failed:', err);
+
+    return res.status(200).json({
+      order_id,
+      tracking_id: shipment.tracking_id,
+      courier: shipment.courier,
+      status: shipment.last_status || 'Pending',
+      current_location: shipment.current_location,
+      estimated_delivery: shipment.estimated_delivery,
+      history: safeJson(shipment.raw_history, []),
+      last_updated: shipment.last_updated,
+      source: 'last_known',
+      warning: 'Live scraping failed. Showing last saved status.',
+      details: err.message,
+    });
   }
 }
 
-// ─── DELETE tracking ──────────────────────────────────────────────────────────
 async function deleteTracking(req, res, order_id) {
   const supabase = getSupabase();
-  const { error } = await supabase.from('shipments').delete().eq('order_id', order_id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ message: 'Tracking removed successfully' });
+
+  const { error } = await supabase
+    .from('shipments')
+    .delete()
+    .eq('order_id', order_id);
+
+  if (error) {
+    return res.status(500).json({ error: error.message });
+  }
+
+  return res.json({ message: 'Tracking removed successfully' });
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractIdFromUrl(url) {
   try {
     const u = new URL(url);
-    for (const [, v] of u.searchParams) { if (/^[A-Z0-9]{8,25}$/i.test(v)) return v.toUpperCase(); }
-    for (const p of u.pathname.split('/').filter(Boolean).reverse()) { if (/^[A-Z0-9]{8,25}$/i.test(p)) return p.toUpperCase(); }
+
+    for (const [, value] of u.searchParams) {
+      if (/^[A-Z0-9]{8,30}$/i.test(value)) return value.toUpperCase();
+    }
+
+    const parts = u.pathname.split('/').filter(Boolean).reverse();
+    for (const part of parts) {
+      if (/^[A-Z0-9]{8,30}$/i.test(part)) return part.toUpperCase();
+    }
   } catch (_) {}
+
   return 'UNKNOWN';
 }
 
 function formatOrder(row) {
-  const s = row.shipments?.[0] || row.shipments;
+  const shipment = row.shipments?.[0] || row.shipments;
+
   return {
-    order_id: row.order_id, customer_name: row.customer_name,
-    items: row.items, created_at: row.created_at,
-    shipment: s ? {
-      tracking_id: s.tracking_id, courier: s.courier, tracking_link: s.tracking_link,
-      status: s.last_status, current_location: s.current_location,
-      estimated_delivery: s.estimated_delivery, last_updated: s.last_updated,
-      history: Array.isArray(s.raw_history) ? s.raw_history : safeJson(s.raw_history, []),
-    } : null,
+    order_id: row.order_id,
+    customer_name: row.customer_name,
+    items: row.items,
+    created_at: row.created_at,
+    shipment: shipment
+      ? {
+          tracking_id: shipment.tracking_id,
+          courier: shipment.courier,
+          tracking_link: shipment.tracking_link,
+          status: shipment.last_status,
+          current_location: shipment.current_location,
+          estimated_delivery: shipment.estimated_delivery,
+          last_updated: shipment.last_updated,
+          history: safeJson(shipment.raw_history, []),
+        }
+      : null,
   };
 }
 
-function safeJson(v, fallback) {
-  try { return JSON.parse(v); } catch { return fallback; }
+function safeJson(value, fallback) {
+  if (!value) return fallback;
+  if (Array.isArray(value) || typeof value === 'object') return value;
+
+  try {
+    return JSON.parse(value);
+  } catch (_) {
+    return fallback;
+  }
 }

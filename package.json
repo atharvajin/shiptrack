@@ -6,6 +6,9 @@
     "dev": "vercel dev",
     "build": "npm --prefix frontend install && npm --prefix frontend run build"
   },
+  "engines": {
+    "node": "20.x"
+  },
   "dependencies": {
     "@sparticuz/chromium": "^119.0.2",
     "@supabase/supabase-js": "^2.39.0",

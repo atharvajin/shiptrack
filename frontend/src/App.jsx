@@ -1,14 +1,31 @@
 import { useState, useEffect, useCallback } from "react";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
+const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
 async function apiFetch(path, opts = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...opts.headers },
     ...opts,
   });
-  const data = await res.json();
-  if (!res.ok) throw data;
+
+  const text = await res.text();
+  let data = {};
+
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = {
+        error: `Server returned non-JSON response. Status: ${res.status}`,
+        details: text.slice(0, 500),
+      };
+    }
+  }
+
+  if (!res.ok) {
+    throw data.error ? data : { error: `Request failed with status ${res.status}` };
+  }
+
   return data;
 }
 
