@@ -1,5 +1,6 @@
 const { getSupabase } = require("../lib/supabase");
 const { handleCors } = require("../lib/cors");
+const { requireApiKey, shouldProtectReads } = require("../lib/auth");
 
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
@@ -13,11 +14,13 @@ module.exports = async (req, res) => {
 
   try {
     if (req.method === "GET") {
+      if (shouldProtectReads() && !requireApiKey(req, res)) return;
       return getOrders(req, res);
     }
 
     if (req.method === "POST") {
-      return createOrder(req, res);
+      if (!requireApiKey(req, res)) return;
+      return upsertOrder(req, res);
     }
 
     return res.status(405).json({
@@ -89,31 +92,27 @@ async function getOrders(req, res) {
 
   const formattedOrders = (orders || []).map((order) => {
     const shipment = shipmentByOrderId.get(order.order_id);
-
     return formatOrder(order, shipment);
   });
 
   return res.status(200).json({
+    success: true,
     orders: formattedOrders,
   });
 }
 
-async function createOrder(req, res) {
-  const { order_id, customer_name, items } = req.body || {};
+async function upsertOrder(req, res) {
+  const body = req.body || {};
 
-  if (!order_id || !customer_name || !items) {
+  const cleanOrderId = String(body.order_id || "").trim();
+  const cleanCustomerName = String(
+    body.customer_name || "Marketplace Buyer"
+  ).trim();
+  const cleanItems = String(body.items || "Marketplace Order").trim();
+
+  if (!cleanOrderId) {
     return res.status(400).json({
-      error: "order_id, customer_name, and items are required",
-    });
-  }
-
-  const cleanOrderId = String(order_id).trim();
-  const cleanCustomerName = String(customer_name).trim();
-  const cleanItems = String(items).trim();
-
-  if (!cleanOrderId || !cleanCustomerName || !cleanItems) {
-    return res.status(400).json({
-      error: "order_id, customer_name, and items cannot be empty",
+      error: "order_id is required",
     });
   }
 
@@ -121,29 +120,29 @@ async function createOrder(req, res) {
 
   const { data, error } = await supabase
     .from("orders")
-    .insert({
-      order_id: cleanOrderId,
-      customer_name: cleanCustomerName,
-      items: cleanItems,
-    })
+    .upsert(
+      {
+        order_id: cleanOrderId,
+        customer_name: cleanCustomerName,
+        items: cleanItems,
+      },
+      {
+        onConflict: "order_id",
+      }
+    )
     .select("order_id, customer_name, items, created_at")
     .single();
 
   if (error) {
-    if (error.code === "23505") {
-      return res.status(409).json({
-        error: "Order ID already exists",
-      });
-    }
-
     return res.status(500).json({
-      error: "Failed to create order",
+      error: "Failed to create or update order",
       details: error.message,
     });
   }
 
-  return res.status(201).json({
-    message: "Order created successfully",
+  return res.status(200).json({
+    success: true,
+    message: "Order synced successfully",
     order: formatOrder(data, null),
   });
 }

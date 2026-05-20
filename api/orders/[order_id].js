@@ -1,5 +1,6 @@
 const { getSupabase } = require("../lib/supabase");
 const { handleCors } = require("../lib/cors");
+const { requireApiKey, shouldProtectReads } = require("../lib/auth");
 
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
@@ -12,7 +13,8 @@ module.exports = async (req, res) => {
   res.setHeader("Expires", "0");
 
   try {
-    const { order_id } = req.query;
+    const rawOrderId = req.query?.order_id;
+    const order_id = Array.isArray(rawOrderId) ? rawOrderId[0] : rawOrderId;
 
     if (!order_id) {
       return res.status(400).json({
@@ -21,11 +23,13 @@ module.exports = async (req, res) => {
     }
 
     if (req.method === "GET") {
-      return getOrder(req, res, order_id);
+      if (shouldProtectReads() && !requireApiKey(req, res)) return;
+      return getOrder(req, res, String(order_id).trim());
     }
 
     if (req.method === "DELETE") {
-      return deleteOrder(req, res, order_id);
+      if (!requireApiKey(req, res)) return;
+      return deleteOrder(req, res, String(order_id).trim());
     }
 
     return res.status(405).json({
@@ -85,6 +89,7 @@ async function getOrder(req, res, order_id) {
   }
 
   return res.status(200).json({
+    success: true,
     order: formatOrder(order, shipment),
   });
 }
@@ -107,6 +112,7 @@ async function deleteOrder(req, res, order_id) {
   }
 
   return res.status(200).json({
+    success: true,
     message: "Order deleted successfully",
     order_id,
   });

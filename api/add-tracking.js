@@ -1,5 +1,6 @@
 const { getSupabase } = require("./lib/supabase");
 const { handleCors } = require("./lib/cors");
+const { requireApiKey } = require("./lib/auth");
 const { parseTrackingLink, detectCourierFromUrl } = require("./lib/parser");
 const { scrapeTrackingUrl } = require("./lib/scraper");
 
@@ -20,6 +21,8 @@ module.exports = async (req, res) => {
     });
   }
 
+  if (!requireApiKey(req, res)) return;
+
   try {
     const { order_id, tracking_link } = req.body || {};
 
@@ -35,7 +38,13 @@ module.exports = async (req, res) => {
     const cleanLink = String(tracking_link).trim();
 
     try {
-      new URL(cleanLink);
+      const parsedUrl = new URL(cleanLink);
+
+      if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+        return res.status(422).json({
+          error: "Invalid URL. Paste the full https:// courier tracking link.",
+        });
+      }
     } catch (_) {
       return res.status(422).json({
         error: "Invalid URL. Paste the full https:// courier tracking link.",
@@ -62,8 +71,7 @@ module.exports = async (req, res) => {
     const fallbackTrackingId =
       parsed.tracking_id || extractTrackingIdFromUrl(cleanLink);
 
-    const fallbackCourier =
-      parsed.courier || detectCourierFromUrl(cleanLink);
+    const fallbackCourier = parsed.courier || detectCourierFromUrl(cleanLink);
 
     let scraped = {
       status: "Pending",
@@ -78,7 +86,7 @@ module.exports = async (req, res) => {
 
     try {
       scraped = await scrapeTrackingUrl(cleanLink);
-      scrape_ok = scraped.status && scraped.status !== "Pending";
+      scrape_ok = !!scraped.status && scraped.status !== "Pending";
     } catch (err) {
       scrape_error = err.message;
       console.warn("[add-tracking scrape failed]", err.message);
@@ -87,11 +95,7 @@ module.exports = async (req, res) => {
     const finalStatus = normalizeAppStatus(scraped.status || "Pending");
     const finalCourier = scraped.courier || fallbackCourier;
     const finalTrackingId = fallbackTrackingId;
-
-    const finalHistory = Array.isArray(scraped.history)
-      ? scraped.history
-      : [];
-
+    const finalHistory = Array.isArray(scraped.history) ? scraped.history : [];
     const finalEstimatedDelivery = normalizeDate(scraped.estimated_delivery);
 
     const { error: upsertError } = await supabase.from("shipments").upsert(
@@ -118,7 +122,8 @@ module.exports = async (req, res) => {
       });
     }
 
-    return res.status(201).json({
+    return res.status(200).json({
+      success: true,
       message: "Tracking saved successfully",
       order_id: cleanOrderId,
       tracking_id: finalTrackingId,
@@ -202,7 +207,9 @@ function normalizeAppStatus(status) {
     s.includes("arrived") ||
     s.includes("departed") ||
     s.includes("hub") ||
-    s.includes("facility")
+    s.includes("facility") ||
+    s.includes("picked up") ||
+    s.includes("dispatched")
   ) {
     return "In Transit";
   }
