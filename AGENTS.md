@@ -1,5 +1,24 @@
 # ShipTrack — Agent Memory
 
+## How to Run
+```powershell
+# Start API backend (port 4000)
+cd C:\Users\Jog JK\shiptrack-v2-vercel-fixed
+node server.js
+
+# Start frontend (port 3000) in a separate terminal
+cd C:\Users\Jog JK\shiptrack-v2-vercel-fixed\frontend
+npx vite --port 3000
+```
+
+Then open http://localhost:3000 in your browser.
+
+## Puppeteer Scraper
+- `api/lib/scraper.js` — `scrapeWithBrowser(url)` auto-detects Chrome installation
+- Used as fallback when HTTP scraping returns Pending (for JS-rendered courier pages like Ekart)
+- Chrome path detection: `C:\Program Files\Google\Chrome\Application\chrome.exe`, then (x86), then LocalAppData, then `$CHROME_PATH`, then `where chrome`
+- Browser instance is cached and reused across requests
+
 ## Bugs Fixed (July 2026)
 
 ### 1. Refresh-tracking endpoint broken (500 error)

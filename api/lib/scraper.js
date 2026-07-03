@@ -666,39 +666,116 @@ async function scrapeTrackingUrl(url) {
 
   if (strategy) {
     console.log(`[Scraper] Using ${strategy.name} strategy`);
+    let result;
     try {
-      const result = await strategy.scrape(url);
+      result = await strategy.scrape(url);
       result.courier = strategy.name;
       result.status = normalizeStatus(result.status);
       result.history = (result.history || []).filter(h => h.message?.length > 2);
       console.log(`[Scraper] ✓ ${strategy.name}: ${result.status} @ ${result.location || 'unknown'}`);
-      return result;
     } catch (err) {
       console.warn(`[Scraper] ${strategy.name} failed (${err.message}) — trying direct HTML`);
       try {
         const res = await fetchUrl(url);
-        const result = scrapeHtml(res.body, strategy.name);
+        result = scrapeHtml(res.body, strategy.name);
         result.courier = strategy.name;
-        return result;
       } catch (err2) {
         console.error(`[Scraper] HTML fallback also failed: ${err2.message}`);
-        return { status: 'Pending', location: null, estimated_delivery: null, history: [], courier: strategy.name };
+        result = { status: 'Pending', location: null, estimated_delivery: null, history: [], courier: strategy.name };
       }
     }
+    if (result.status === 'Pending') {
+      const browserResult = await scrapeWithBrowser(url);
+      if (browserResult) Object.assign(result, browserResult);
+    }
+    return result;
   }
 
   // Unknown courier — try direct HTML scrape
   console.log(`[Scraper] Unknown courier — trying generic HTML scrape`);
   const courier = detectCourierFromUrl(url);
+  let result;
   try {
     const res = await fetchUrl(url);
-    const result = scrapeHtml(res.body, courier);
+    result = scrapeHtml(res.body, courier);
     result.courier = courier;
-    return result;
   } catch (err) {
     console.error(`[Scraper] Generic scrape failed: ${err.message}`);
-    return { status: 'Pending', location: null, estimated_delivery: null, history: [], courier };
+    result = { status: 'Pending', location: null, estimated_delivery: null, history: [], courier };
+  }
+  if (result.status === 'Pending') {
+    const browserResult = await scrapeWithBrowser(url);
+    if (browserResult) Object.assign(result, browserResult);
+  }
+  return result;
+}
+
+// ─── Puppeteer-based scraper (for JS-rendered pages) ─────────────────────────
+let browserInstance = null;
+
+async function getBrowser() {
+  if (browserInstance && browserInstance.isConnected()) return browserInstance;
+  try {
+    const puppeteer = require('puppeteer-core');
+    const paths = [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+      process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+      process.env.CHROME_PATH,
+    ].filter(Boolean);
+    let executablePath = paths.find(p => { try { return require('fs').existsSync(p); } catch { return false; } });
+    if (!executablePath) {
+      try {
+        const { execSync } = require('child_process');
+        executablePath = execSync('where chrome', { encoding: 'utf8', timeout: 3000 }).split('\n')[0].trim();
+      } catch {}
+    }
+    if (!executablePath) return null;
+    browserInstance = await puppeteer.launch({
+      executablePath,
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+    return browserInstance;
+  } catch (err) {
+    console.warn('[Scraper] Puppeteer not available:', err.message);
+    return null;
   }
 }
 
-module.exports = { scrapeTrackingUrl, normalizeStatus };
+async function scrapeWithBrowser(url) {
+  let browser = null;
+  let page = null;
+  try {
+    browser = await getBrowser();
+    if (!browser) throw new Error('No browser available');
+    page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 800 });
+    const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
+    if (!response) throw new Error('No response from page');
+    // Wait for tracking content to render
+    await page.waitForTimeout(2000);
+    const html = await page.content();
+    const pageUrl = response.url();
+    const courier = detectCourierFromUrl(url);
+    const result = scrapeHtml(html, courier);
+    result.courier = courier;
+    // Try to get additional details from page title or URL-specific patterns
+    if (result.status === 'Pending') {
+      const title = await page.title();
+      if (title) {
+        const titleResult = scrapeHtml('<html><body>' + title + '</body></html>', courier);
+        if (titleResult.status !== 'Pending') result.status = titleResult.status;
+      }
+    }
+    return result;
+  } catch (err) {
+    console.warn(`[Scraper] Browser scrape failed for ${url}: ${err.message}`);
+    return null;
+  } finally {
+    if (page) try { await page.close(); } catch {}
+  }
+}
+
+module.exports = { scrapeTrackingUrl, normalizeStatus, scrapeWithBrowser };
