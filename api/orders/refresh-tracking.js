@@ -1,8 +1,8 @@
-const { getSupabase } = require("../../lib/supabase");
-const { handleCors } = require("../../lib/cors");
-const { requireApiKey } = require("../../lib/auth");
-const { parseTrackingLink, detectCourierFromUrl } = require("../../lib/parser");
-const { scrapeTrackingUrl } = require("../../lib/scraper");
+const { getSupabase } = require("../lib/supabase");
+const { handleCors } = require("../lib/cors");
+const { requireApiKey } = require("../lib/auth");
+const { parseTrackingLink, detectCourierFromUrl } = require("../lib/parser");
+const { scrapeTrackingUrl } = require("../lib/scraper");
 
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
@@ -80,7 +80,7 @@ module.exports = async (req, res) => {
     }
 
     const finalStatus = normalizeAppStatus(
-      scraped.status || shipment.last_status || "Pending"
+      scraped.status || "Pending"
     );
 
     const finalCourier =
@@ -159,16 +159,40 @@ function normalizeAppStatus(status) {
 
   const s = String(status).toLowerCase();
 
-  if (s.includes("out for delivery") || s.includes("out-for-delivery")) {
-    return "Out for Delivery";
-  }
-
-  if (s === "ofd" || s.includes(" with delivery agent")) {
-    return "Out for Delivery";
-  }
-
   if (s.includes("delivered") && !s.includes("out for delivery")) {
     return "Delivered";
+  }
+
+  if (s.includes("out for delivery") || s.includes("out-for-delivery") || s === "ofd" || s.includes(" with delivery agent")) {
+    return "Out for Delivery";
+  }
+
+  if (s.includes("return to origin") || s.includes("rto") || s.includes("returning to seller")) {
+    return "Return to Origin";
+  }
+
+  if (s.includes("cancelled") || s.includes("canceled")) {
+    return "Cancelled";
+  }
+
+  if (s.includes("lost")) {
+    return "Lost";
+  }
+
+  if (s.includes("damaged")) {
+    return "Damaged";
+  }
+
+  if (s.includes("delivery attempted") || s.includes("attempt failed") || s.includes("undelivered") || s.includes("unable to deliver")) {
+    return "Delivery Attempted";
+  }
+
+  if (s.includes("unserviceable")) {
+    return "Unserviceable";
+  }
+
+  if (s.includes("on hold") || s.includes("held") || s.includes("detained")) {
+    return "On Hold";
   }
 
   if (
@@ -179,17 +203,15 @@ function normalizeAppStatus(status) {
     s.includes("hub") ||
     s.includes("facility") ||
     s.includes("picked up") ||
-    s.includes("dispatched")
+    s.includes("dispatched") ||
+    s.includes("at local facility")
   ) {
     return "In Transit";
   }
 
   if (
     s.includes("exception") ||
-    s.includes("failed") ||
-    s.includes("attempted") ||
-    s.includes("undelivered") ||
-    s.includes("unable to deliver")
+    s.includes("failed")
   ) {
     return "Exception";
   }

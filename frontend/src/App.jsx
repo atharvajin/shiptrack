@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
@@ -57,10 +57,17 @@ async function apiFetch(path, opts = {}) {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const STATUS_COLORS = {
-  "In Transit": { bg: "#E6F1FB", text: "#185FA5", border: "#185FA5" },
-  "Out for Delivery": { bg: "#FAEEDA", text: "#854F0B", border: "#BA7517" },
   "Delivered": { bg: "#EAF3DE", text: "#3B6D11", border: "#3B6D11" },
+  "Out for Delivery": { bg: "#FAEEDA", text: "#854F0B", border: "#BA7517" },
+  "In Transit": { bg: "#E6F1FB", text: "#185FA5", border: "#185FA5" },
   "Exception": { bg: "#FCEBEB", text: "#A32D2D", border: "#A32D2D" },
+  "Return to Origin": { bg: "#FCEBEB", text: "#A32D2D", border: "#A32D2D" },
+  "Cancelled": { bg: "#F5F0F0", text: "#6B5E5E", border: "#9C8A8A" },
+  "Lost": { bg: "#2D1B1B", text: "#FF6B6B", border: "#6B2020" },
+  "Damaged": { bg: "#FCEBEB", text: "#A32D2D", border: "#A32D2D" },
+  "Delivery Attempted": { bg: "#FFF3E0", text: "#BF6A00", border: "#E89A2E" },
+  "Unserviceable": { bg: "#F5F0F0", text: "#6B5E5E", border: "#9C8A8A" },
+  "On Hold": { bg: "#F0F4FF", text: "#3A5A9F", border: "#5A7ABF" },
   "Pending": { bg: "#F1EFE8", text: "#5F5E5A", border: "#888780" },
 };
 
@@ -98,7 +105,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function StatusBadge({ status }) {
   const cfg = STATUS_COLORS[status] || STATUS_COLORS["Pending"];
-  const pulse = ["In Transit", "Out for Delivery"].includes(status);
+    const pulse = ["In Transit", "Out for Delivery", "Delivery Attempted", "On Hold"].includes(status);
   return (
     <span style={{
       display: "inline-flex", alignItems: "center", gap: 6,
@@ -163,7 +170,7 @@ function TrackingCard({ shipment, orderId, onRefresh }) {
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
-      await apiFetch(`/orders/${orderId}/refresh-tracking`, { method: "POST" });
+      await apiFetch(`/orders/refresh-tracking?order_id=${orderId}`, { method: "POST" });
       onRefresh?.();
     } catch (e) { console.error(e); }
     finally { setRefreshing(false); }
@@ -480,6 +487,34 @@ export default function App() {
   useEffect(() => {
     load();
     const t = setInterval(load, 60000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const ordersRef = useRef(orders);
+  ordersRef.current = orders;
+
+  // Auto-refresh active (non-terminal) shipments every 5 minutes
+  useEffect(() => {
+    const TERMINAL_STATUSES = ["Delivered", "Cancelled", "Return to Origin", "Lost", "Damaged", "Delivery Attempted", "On Hold", "Unserviceable"];
+
+    const refreshActive = async () => {
+      const active = ordersRef.current.filter(
+        o => o.shipment && !TERMINAL_STATUSES.includes(o.shipment.status)
+      ).slice(0, 3);
+
+      for (const order of active) {
+        try {
+          await apiFetch(`/orders/refresh-tracking?order_id=${order.order_id}`, { method: "POST" });
+        } catch (e) {
+          // individual refresh errors are expected (timeout, courier down, etc.)
+        }
+      }
+      if (active.length > 0) {
+        await load();
+      }
+    };
+
+    const t = setInterval(refreshActive, 300000);
     return () => clearInterval(t);
   }, [load]);
 

@@ -54,7 +54,7 @@ const STATUS_MAP = [
 ];
 
 function normalizeStatus(raw) {
-  if (!raw) return 'In Transit';
+  if (!raw) return 'Pending';
   const lower = raw.toLowerCase().trim();
 
   for (const { keywords, status } of STATUS_MAP) {
@@ -258,35 +258,21 @@ function scrapeEkartHtml(html) {
 
   const lower = text.toLowerCase();
 
+  let estimated_delivery = null;
+  let location = null;
   let status = 'Pending';
 
-  const exactStatusPatterns = [
-    /current\s+status[:\s]+(out\s+for\s+delivery|delivered|in\s+transit|pending|shipment\s+details\s+received|arrived\s+at\s+your\s+nearest\s+hub)/i,
-    /(out\s+for\s+delivery)/i,
-    /(delivered)/i,
-  ];
-
-  for (const pattern of exactStatusPatterns) {
-    const match = text.match(pattern);
-
-    if (match?.[1]) {
-      status = normalizeStatus(match[1]);
-      break;
-    }
-  }
-
-  if (lower.includes('out for delivery')) {
-    status = 'Out for Delivery';
-  } else if (lower.includes('delivered') && !lower.includes('out for delivery')) {
+  // Simple rule-based status detection (delivered checked first)
+  if (lower.includes('delivered') && !lower.includes('out for delivery')) {
     status = 'Delivered';
+  } else if (lower.includes('out for delivery')) {
+    status = 'Out for Delivery';
   } else if (
     lower.includes('arrived at your nearest hub') ||
     lower.includes('shipment details received')
   ) {
     status = 'In Transit';
   }
-
-  let estimated_delivery = null;
 
   const expectedPatterns = [
     /expected\s+on[:\s]+([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})/i,
@@ -303,10 +289,16 @@ function scrapeEkartHtml(html) {
     }
   }
 
-  let location = null;
-
   if (lower.includes('arrived at your nearest hub')) {
     location = 'Nearest Hub';
+  }
+
+  // Fall back to generic full-page scan if not yet detected
+  if (status === 'Pending') {
+    const generic = scrapeHtml(html, 'Ekart');
+    status = generic.status;
+    if (!location) location = generic.location;
+    if (!estimated_delivery) estimated_delivery = generic.estimated_delivery;
   }
 
   const history = [];
