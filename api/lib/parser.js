@@ -113,11 +113,32 @@ function parseTrackingLink(input) {
     }
   }
 
+  const NON_TRACKING_TOKENS = new Set([
+    'www', 'com', 'in', 'co', 'net', 'org', 'track', 'tracking', 'trackorder',
+    'trackorderid', 'order', 'orders', 'page', 'home', 'index', 'default',
+    'ship', 'shipment', 'consignment', 'awb', 'wbn', 'waybill', 'bluedart',
+    'delhivery', 'dtdc', 'fedex', 'dhl', 'ekart', 'shiprocket', 'xpressbees',
+    'india', 'post', 'ecom', 'express', 'shadowfax', 'ups', 'amazon',
+    'api', 'v1', 'v2', 'v3', 'external', 'courier',
+  ]);
+
+  function looksLikeTrackingId(token) {
+    if (!token || token.length < 6 || token.length > 30) return false;
+    if (!/^[A-Z0-9]+$/i.test(token)) return false;
+    const upper = token.toUpperCase();
+    if (NON_TRACKING_TOKENS.has(upper)) return false;
+    // Must contain at least one digit and one letter, or be all digits long enough
+    const hasDigit = /\d/.test(upper);
+    const hasAlpha = /[A-Z]/i.test(upper);
+    return hasDigit && hasAlpha;
+  }
+
   const allParams = [...parsedUrl.searchParams.values()];
   const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
 
-  for (const candidate of [...allParams, ...pathParts].reverse()) {
-    if (/^[A-Z0-9]{8,30}$/i.test(candidate)) {
+  // Check path parts first (tracking IDs usually live in URL paths), then params
+  for (const candidate of [...pathParts, ...allParams]) {
+    if (looksLikeTrackingId(candidate)) {
       return {
         tracking_id: candidate.toUpperCase(),
         courier: detectCourierFromUrl(trimmed),

@@ -349,23 +349,54 @@ function ScrapingProgress({ step }) {
   );
 }
 
+const COURIER_URL_PATTERNS = {
+  Delhivery: "https://track.delhivery.com/p/{id}",
+  BlueDart: "https://www.bluedart.com/tracking?waybill={id}",
+  DTDC: "https://www.dtdc.com/tracking?trackingno={id}",
+  Ekart: "https://www.ekartlogistics.com/ekartlogistics-web/shipmenttrack/{id}",
+  FedEx: "https://www.fedex.com/fedextrack/?trknbr={id}",
+  DHL: "https://www.dhl.com/en/express/tracking.html?tracking-id={id}",
+  Shiprocket: "https://shiprocket.in/tracking/{id}",
+  Xpressbees: "https://www.xpressbees.com/shipment/tracking/?awb={id}",
+  "India Post": "https://www.indiapost.gov.in/_layouts/15/dop.portal.tracking/TrackConsignment.aspx?scode={id}",
+  "Ecom Express": "https://ecomexpress.in/tracking/?awb_number={id}",
+  Shadowfax: "",
+};
+
 function AddTrackingForm({ orderId, onSuccess, onCancel }) {
-  const [url, setUrl] = useState("");
+  const [input, setInput] = useState("");
+  const [courier, setCourier] = useState("");
+  const [mode, setMode] = useState("url");
   const [step, setStep] = useState(-1);
   const [error, setError] = useState(null);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    if (!url.trim()) return;
+    if (!input.trim()) return;
 
     setError(null);
 
-    try {
-      new URL(url.trim());
-    } catch (_) {
-      setError("Invalid URL — paste the full https:// link from the courier website");
-      return;
+    let trackingLink = input.trim();
+
+    if (mode === "id") {
+      if (!courier) {
+        setError("Please select a courier when entering a tracking ID only");
+        return;
+      }
+      const pattern = COURIER_URL_PATTERNS[courier];
+      if (!pattern) {
+        setError(`No tracking URL pattern for ${courier}. Paste a full courier URL instead.`);
+        return;
+      }
+      trackingLink = pattern.replace("{id}", input.trim());
+    } else {
+      try {
+        new URL(trackingLink);
+      } catch (_) {
+        setError("Invalid URL — paste the full https:// link from the courier website");
+        return;
+      }
     }
 
     const simulateSteps = async () => {
@@ -383,7 +414,7 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
           method: "POST",
           body: JSON.stringify({
             order_id: orderId,
-            tracking_link: url.trim(),
+            tracking_link: trackingLink,
           }),
         }),
         simulateSteps(),
@@ -392,7 +423,7 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
       setStep(SCRAPE_STEPS.length - 1);
       await sleep(400);
 
-      setUrl("");
+      setInput("");
       setStep(-1);
 
       await onSuccess?.();
@@ -402,18 +433,51 @@ function AddTrackingForm({ orderId, onSuccess, onCancel }) {
     }
   };
 
+  const isUrlMode = mode === "url";
+
   return (
     <form onSubmit={handleSubmit}>
-      <div style={{ display: "flex", gap: 8 }}>
-        <input
-          type="text" value={url} onChange={e => setUrl(e.target.value)}
-          placeholder="https://www.delhivery.com/track/package?wbn=DEL123..."
-          style={{ flex: 1 }} disabled={step >= 0} autoFocus
-        />
-        <button type="submit" disabled={step >= 0 || !url.trim()}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <select
+          value={courier}
+          onChange={e => setCourier(e.target.value)}
+          disabled={step >= 0}
+          style={{ padding: "4px 10px", fontSize: 12, borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)" }}
+        >
+          <option value="">Auto-detect from URL</option>
+          {Object.keys(COURIER_URL_PATTERNS).map(c => (
+            <option key={c} value={c}>{c}</option>
+          ))}
+        </select>
+
+        {isUrlMode ? (
+          <input
+            type="text" value={input} onChange={e => setInput(e.target.value)}
+            placeholder="https://www.delhivery.com/track/package?wbn=DEL123..."
+            style={{ flex: 1, minWidth: 200 }} disabled={step >= 0} autoFocus
+          />
+        ) : (
+          <input
+            type="text" value={input} onChange={e => setInput(e.target.value)}
+            placeholder="DEL1234567890 (tracking number only)"
+            style={{ flex: 1, minWidth: 200 }} disabled={step >= 0} autoFocus
+          />
+        )}
+
+        <button type="button" onClick={() => setMode(isUrlMode ? "id" : "url")} disabled={step >= 0}
+          style={{ fontSize: 12, padding: "4px 12px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", cursor: "pointer" }}>
+          {isUrlMode ? "Tracking ID only" : "Full URL"}
+        </button>
+
+        <button type="submit" disabled={step >= 0 || !input.trim()}
+          style={{ fontSize: 12, padding: "4px 12px", borderRadius: "var(--border-radius-md)", border: "none", background: "#185FA5", color: "#fff", cursor: "pointer" }}>
           {step >= 0 ? "Scraping..." : "Extract & track"}
         </button>
-        <button type="button" onClick={onCancel} disabled={step >= 0}>Cancel</button>
+
+        <button type="button" onClick={onCancel} disabled={step >= 0}
+          style={{ fontSize: 12, padding: "4px 12px", borderRadius: "var(--border-radius-md)", border: "0.5px solid var(--color-border-secondary)", background: "none", color: "var(--color-text-secondary)", cursor: "pointer" }}>
+          Cancel
+        </button>
       </div>
 
       {step >= 0 && <ScrapingProgress step={step} />}

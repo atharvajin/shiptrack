@@ -118,10 +118,32 @@ function scrapeHtml(html, courierName) {
 
   const lower = text.toLowerCase();
 
-  // Detect status from full page text
+  // Extract history from HTML tables FIRST — latest event determines status
+  const history = [];
+  const tableRowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rowMatch;
+  while ((rowMatch = tableRowRegex.exec(html)) !== null) {
+    const cells = [...rowMatch[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+      .map(c => c[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    if (cells.length >= 2 && cells[1].length > 3 && !/^(date|time|status|location|event|description)$/i.test(cells[0])) {
+      history.push({
+        timestamp: cells[0] || null,
+        message: cells[1] || null,
+        location: cells[2] || null,
+        status: normalizeStatus(cells[1]),
+      });
+    }
+  }
+
+  // Detect status — prefer latest history event, fall back to full-page keyword scan
   let status = 'Pending';
-  for (const { keywords, s } of STATUS_MAP.map(m => ({ keywords: m.keywords, s: m.status }))) {
-    if (keywords.some(k => lower.includes(k))) { status = s; break; }
+  if (history.length > 0) {
+    status = history[history.length - 1].status || 'Pending';
+  } else {
+    for (const { keywords, s } of STATUS_MAP.map(m => ({ keywords: m.keywords, s: m.status }))) {
+      if (keywords.some(k => lower.includes(k))) { status = s; break; }
+    }
   }
 
   // Extract location — look for city/hub names near keywords
@@ -145,24 +167,6 @@ function scrapeHtml(html, courierName) {
   for (const p of eddPatterns) {
     const m = text.match(p);
     if (m?.[1]) { edd = m[1].trim(); break; }
-  }
-
-  // Extract history from HTML tables
-  const history = [];
-  const tableRowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  let rowMatch;
-  while ((rowMatch = tableRowRegex.exec(html)) !== null) {
-    const cells = [...rowMatch[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
-      .map(c => c[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim())
-      .filter(Boolean);
-    if (cells.length >= 2 && cells[1].length > 3 && !/^(date|time|status|location|event|description)$/i.test(cells[0])) {
-      history.push({
-        timestamp: cells[0] || null,
-        message: cells[1] || null,
-        location: cells[2] || null,
-        status: normalizeStatus(cells[1]),
-      });
-    }
   }
 
   // Also try list-based timelines (div/li patterns)

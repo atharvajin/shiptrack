@@ -16,6 +16,6 @@
     "puppeteer-core": "^21.6.1"
   },
   "devDependencies": {
-    "vercel": "^33.0.0"
+    "vercel": "^65.8.0"
   }
 }
